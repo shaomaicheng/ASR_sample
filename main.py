@@ -1,4 +1,5 @@
 import numpy as np
+import onnx
 import onnxruntime as ort
 import librosa
 
@@ -19,7 +20,7 @@ def load_tokens(token_file):
 # ----------------------------
 def extract_fbank(audio_path, n_mels=80, frame_length=25, frame_shift=10, sr=16000):
     # Load audio
-    waveform, _ = librosa.load(audio_path, sr=sr, mono=True)
+    waveform, _ = librosa.load(audio_path, sr=sr)
     # Pre-emphasis
     waveform = np.append(waveform[0], waveform[1:] - 0.97 * waveform[:-1])
     # FBank
@@ -29,23 +30,10 @@ def extract_fbank(audio_path, n_mels=80, frame_length=25, frame_shift=10, sr=160
         hop_length=int(sr * 0.001 * frame_shift),
         fmin=20, fmax=8000
     )
+    # print(fbank.shape)
     fbank = np.log(fbank + 1e-6).T  # (T, 80)
+    # print(fbank.shape)
     return fbank.astype(np.float32)
-
-def apply_cmvn(cmvn_file):
-    # 读取 am.mvn（Kaldi 格式）
-    with open(cmvn_file, "r") as f:
-        lines = f.readlines()
-    neg_mean = None
-    inv_stddev = None
-    for line in lines:
-        if line.startswith("<LearnRateCoef>"):
-            parts = line.strip().split()[3:-1]
-            if neg_mean is None:
-                neg_mean = np.array([float(x) for x in parts], dtype=np.float32)
-            else:
-                inv_stddev = np.array([float(x) for x in parts], dtype=np.float32)
-    return neg_mean, inv_stddev
 
 # ----------------------------
 # 3. LFR 特征拼接（Lookahead +拼接）
@@ -66,7 +54,7 @@ def apply_lfr(features, lfr_m=5, lfr_n=1):
                 chunk = np.concatenate([pad, chunk], axis=0)
             else:  # 后面补
                 chunk = np.concatenate([chunk, pad], axis=0)
-        LFR_features.append(chunk.flatten())
+        LFR_features.append(chunk.flatten()) # 多个形状相同的数组“打包”成一个更高维的数组。
     return np.stack(LFR_features, axis=0)  # (T', 80*lfr_m)
 
 # ----------------------------
@@ -81,120 +69,87 @@ def main():
     # 1. 提取原始 fbank (T, 80)
     fbank = extract_fbank(audio_path)  # 不要在这里做 CMVN！
 
+    model = onnx.load("new-model/model.onnx")
+    meta = {prop.key: prop.value for prop in model.metadata_props}
+
     # 2. 应用 LFR → (T', 560)
-    feats = apply_lfr(fbank, lfr_m=7, lfr_n=6)  # 注意：用 7 和 6！
+    lfr_m = int(meta["lfr_window_size"])
+    lfr_n = int(meta["lfr_window_shift"])
+    # print("lfr_m:", lfr_m)
+    # print("lfr_n:", lfr_n)
+    feats = apply_lfr(fbank, lfr_m, lfr_n)  # 注意：用 7 和 6！
+
 
     # 3. 加载 560 维 CMVN 参数
-    neg_mean, inv_stddev = apply_cmvn("model/am.mvn")
+    neg_mean = np.array([float(x) for x in meta["neg_mean"].split(",")], dtype=np.float32)
+    inv_stddev = np.array([float(x) for x in meta["inv_stddev"].split(",")], dtype=np.float32)
 
-    # 4. 对 LFR 后的特征做 CMVN
-    feats = (feats + neg_mean) * inv_stddev  # 现在 feats 是 (T', 560)，neg_mean 是 (560,)
+    # 4. 对 LFR 后的特征做 CMVN归一化
+    feats = feats * inv_stddev + neg_mean # 现在 feats 是 (T', 560)，neg_mean 是 (560,)
 
     # 准备输入
     speech = feats[np.newaxis, :, :]  # (1, T, 400) → 注意：LFR后是 80*5=400
+
     speech_lengths = np.array([feats.shape[0]], dtype=np.int32)
 
     # 加载 encoder
-    encoder_sess = ort.InferenceSession("model/model.onnx")
+    encoder_sess = ort.InferenceSession("new-model/model.onnx")
     enc_out = encoder_sess.run(
         ["enc", "enc_len", "alphas"],
         {"speech": speech, "speech_lengths": speech_lengths}
     )
     enc, enc_len, alphas = enc_out
-
-    # 生成 acoustic embeddings（简化：用 enc 代替）
-    acoustic_embeds = enc
-    acoustic_embeds_len = enc_len
-
-    # 初始化 decoder cache（共16层，每层 [1, 512, 10]）
-    cache_dim = 10
-    cache = [np.zeros((1, 512, cache_dim), dtype=np.float32) for _ in range(16)]
-
-    # decoder 输入
+    # 加载 decoder
+    decoder_sess = ort.InferenceSession("model/decoder.onnx")
+    # cache
+    cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
     decoder_inputs = {
         "enc": enc,
         "enc_len": enc_len,
-        "acoustic_embeds": acoustic_embeds,
-        "acoustic_embeds_len": acoustic_embeds_len,
+        "acoustic_embeds": enc,
+        "acoustic_embeds_len": enc_len,
     }
     for i in range(16):
         decoder_inputs[f"in_cache_{i}"] = cache[i]
-
-    # 加载 decoder
-    decoder_sess = ort.InferenceSession("model/decoder.onnx")
     outputs = decoder_sess.run(None, decoder_inputs)
-
-    logits = outputs[0]  # (1, T, 8404)
-    sample_ids = outputs[1]  # (1, T)
-
-    # 解码
-
-    # print(logits)
-    print(sample_ids)
-    # for idx in sample_ids[0]:
-    #     print(tokens.get(idx))
+    logits = outputs[0]
+    sample_ids = outputs[1]
     text = "".join([tokens.get(int(idx), "<unk>") for idx in sample_ids[0]])
-    print("识别结果:", text)
+    print(text)
 
+    # 循环
+    # chunk_size = 100
+    # all_token_ids=[]
+    # T = enc.shape[1]
+    # offset = 0
+    # in_cache = [np.zeros((1, 512, 10), dtype=np.float32) for _ in range(16)]
+    # # 3. 流式解码
+    # while offset < T:
+    #     end = min(offset + chunk_size, T)
+    #     enc_chunk = enc[:, offset:end, :]
+    #     L = end - offset
+    #     enc_len_np = np.array([L], dtype=np.int32)
+    #
+    #     inputs = {
+    #         "enc": enc_chunk,
+    #         "enc_len": enc_len_np,
+    #         "acoustic_embeds": enc_chunk,
+    #         "acoustic_embeds_len": enc_len_np,
+    #     }
+    #     for i in range(16):
+    #         inputs[f"in_cache_{i}"] = in_cache[i]
+    #
+    #     outputs = decoder_sess.run(None, inputs)
+    #     in_cache = [out.copy() for out in outputs[2:18]]
+    #     offset = end
+    #     clean_ids = []
+    #     for tid in outputs[1][0]:
+    #         if not clean_ids or tid != clean_ids[-1]:
+    #             clean_ids.append(tid)
+    #     for i in clean_ids:
+    #         all_token_ids.append(i)
+    # # 转文本
+    # text = "".join(tokens.get(tid, "<unk>") for tid in all_token_ids)
+    # print(text)
 
 main()
-
-
-
-# # 1. 加载音频
-# y, sr = librosa.load("chinese_output.wav", sr=16000)
-# print(f"✅ 音频: {len(y)/sr:.2f}秒, 采样率={sr}")
-
-# # 2. 提取 FBank
-# fbank = librosa.feature.melspectrogram(
-#     y=y, sr=16000, n_mels=80,
-#     n_fft=400, hop_length=160, fmin=20, fmax=8000
-# )
-# fbank = np.log(fbank + 1e-6).T.astype(np.float32)
-# print("✅ FBank shape:", fbank.shape)
-
-# # 3. LFR (m=7, n=6)
-# T, D = fbank.shape
-# lfr_m, lfr_n = 7, 6
-# lfr_feats = []
-# t = 0
-# while t < T:
-#     chunk = fbank[t:t+lfr_m]
-#     if len(chunk) < lfr_m:
-#         chunk = np.pad(chunk, ((0, lfr_m - len(chunk)), (0, 0)), mode='constant')
-#     lfr_feats.append(chunk.flatten())
-#     t += lfr_n
-# lfr_feats = np.stack(lfr_feats) if lfr_feats else np.zeros((0, 560))
-# print("✅ LFR shape:", lfr_feats.shape)
-
-# # 4. 加载 CMVN
-# with open("model/am.mvn") as f:
-#     lines = f.readlines()
-# neg_mean = inv_stddev = None
-# for line in lines:
-#     if line.startswith("<LearnRateCoef>"):
-#         data = np.array([float(x) for x in line.split()[3:-1]], dtype=np.float32)
-#         if neg_mean is None:
-#             neg_mean = data
-#         else:
-#             inv_stddev = data
-# print("✅ CMVN shape:", neg_mean.shape)
-
-# # 5. 应用 CMVN
-# feats = (lfr_feats + neg_mean) * inv_stddev
-# print("✅ CMVN后 stats: mean=%.3f, std=%.3f" % (feats.mean(), feats.std()))
-
-# # 6. 加载词表
-# tokens = {}
-# with open("model/tokens.txt", encoding="utf-8") as f:
-#     for idx,line in enumerate(f):
-#         token =line.strip()
-#         if token:
-#             tokens[idx] = token
-# print("✅ 词表大小:", len(tokens))
-
-# # 7. 加载模型并推理（简化）
-# encoder = ort.InferenceSession("model/model.onnx")
-# enc_out = encoder.run(None, {"speech": feats[None, :], "speech_lengths": np.array([len(feats)], dtype=np.int32)})
-# enc = enc_out[0]  # (1, T, 512)
-# print("✅ Encoder output shape:", enc.shape)
