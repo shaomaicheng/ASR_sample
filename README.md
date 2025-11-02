@@ -4,6 +4,12 @@ python，使用模型：<font style="color:#080808;background-color:#ffffff;">cs
 
 [https://www.modelscope.cn/models/iic/speech_paraformer_asr_nat-zh-cn-16k-common-vocab8404-online/summary](https://www.modelscope.cn/models/iic/speech_paraformer_asr_nat-zh-cn-16k-common-vocab8404-online/summary)
 
+内部文件：
+* wav_gen.py 生成一个wav文件
+* model_download.py 下载onnx格式的模型，配置文件和词表
+* onnx_format.py 查看模型的输入输出
+* add_model_metadata 该模型的开源脚本，增加配置参数信息，保存新的模型文件
+* main.py 识别生成的这个wav
 
 第一步：使用onnx查看模型的输入输出：
 
