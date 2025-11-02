@@ -1,4 +1,3 @@
-# 桌面
 python，使用模型：<font style="color:#080808;background-color:#ffffff;">csukuangfj/streaming-paraformer-zh</font>
 
 这个是通义的模型导出的oxxn格式。
@@ -8,9 +7,9 @@ python，使用模型：<font style="color:#080808;background-color:#ffffff;">cs
 
 第一步：使用onnx查看模型的输入输出：
 
-![](https://)
+![](https://github.com/shaomaicheng/ASR_sample/blob/main/img/image_1.png?raw=true)
 
-![](https://)
+![](https://github.com/shaomaicheng/ASR_sample/blob/main/img/image_2.png?raw=true)
 
 ```plain
 model.onnx输入
